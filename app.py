@@ -1,7 +1,12 @@
 # ---------------------
-# Generate Report tab (with axis chooser & saved configs)
+# Tabs (ensure they exist here)
 # ---------------------
-with tabs[1]:
+preview_tab, generate_tab, past_tab = st.tabs(["Preview", "Generate Report", "Past Reports"])
+
+# ---------------------
+# Generate Report tab (axis chooser + saved configs + generate)
+# ---------------------
+with generate_tab:
     st.header("Generate Report — choose axes for charts")
     st.markdown("Pick a sheet below to choose X and Y axes. Save axis configs and then Generate Report (auto charts used where no config exists).")
 
@@ -12,39 +17,43 @@ with tabs[1]:
     if "axis_config" not in st.session_state:
         st.session_state["axis_config"] = {}  # key -> dict {x_col, y_cols}
 
-    # Build available sheets from sidebar-chosen files
-    chosen = st.session_state.get("chosen_for_report", []) or []
-    available_sheets = {}
-    for fname in chosen:
-        p = UPLOAD_DIR / fname
-        if not p.exists():
-            continue
-        try:
-            fb = read_file_bytes_from_disk(p)
-            if fname.lower().endswith(".csv"):
-                available_sheets[fname] = {"(csv)": pd.read_csv(BytesIO(fb))}
-            else:
-                engine_kw = _choose_excel_engine_from_filename(fname)
-                xls = pd.ExcelFile(BytesIO(fb), **engine_kw)
-                available_sheets[fname] = {}
-                for s in xls.sheet_names:
-                    available_sheets[fname][s] = pd.read_excel(BytesIO(fb), sheet_name=s, **engine_kw)
-        except Exception:
-            continue
+    # Read chosen files from sidebar session_state (sidebar multiselect must use same key)
+    chosen_files = st.session_state.get("chosen_for_report", []) or []
 
-    # Flatten choices
-    sheet_keys = []
+    # Build available_sheets for chosen files
+    def gather_available_sheets(selected_files: list) -> dict:
+        out = {}
+        for fname in (selected_files or []):
+            p = UPLOAD_DIR / fname
+            if not p.exists():
+                continue
+            try:
+                fb = read_file_bytes_from_disk(p)
+                if fname.lower().endswith(".csv"):
+                    out[fname] = {"(csv)": pd.read_csv(BytesIO(fb))}
+                else:
+                    engine_kw = _choose_excel_engine_from_filename(fname)
+                    xls = pd.ExcelFile(BytesIO(fb), **engine_kw)
+                    out[fname] = {}
+                    for s in xls.sheet_names:
+                        out[fname][s] = pd.read_excel(BytesIO(fb), sheet_name=s, **engine_kw)
+            except Exception:
+                continue
+        return out
+
+    available_sheets = gather_available_sheets(chosen_files)
+    sheet_choices = []
     sheet_map = {}
     for fname, sheets in available_sheets.items():
         for sname in sheets.keys():
             key = f"{fname}::{sname}"
-            sheet_keys.append(key)
+            sheet_choices.append(key)
             sheet_map[key] = (fname, sname)
 
-    if not sheet_keys:
-        st.info("No sheets available. Select files in the sidebar or save uploaded files first.")
+    if not sheet_choices:
+        st.info("No sheets available. Select files in the sidebar and save uploaded files first.")
     else:
-        chosen_sheet_key = st.selectbox("Pick a sheet to configure axes", options=[""] + sheet_keys, key="axis_pick")
+        chosen_sheet_key = st.selectbox("Pick a sheet to configure axes", options=[""] + sheet_choices, key="axis_pick")
         if chosen_sheet_key:
             fname, sname = sheet_map[chosen_sheet_key]
             df = available_sheets[fname][sname]
@@ -52,56 +61,53 @@ with tabs[1]:
             st.dataframe(df.head(10), use_container_width=True)
 
             cols = list(df.columns)
-            # X axis (single)
-            x_col = st.selectbox("Choose X-axis column (single)", options=[""] + cols, key=f"x_{chosen_sheet_key}")
-            # Y axis (one or more)
-            y_cols = st.multiselect("Choose Y-axis column(s) (one or more)", options=cols, default=None, key=f"y_{chosen_sheet_key}")
+            safe_key = re.sub(r"[^0-9a-zA-Z]+", "_", chosen_sheet_key)
+            x_col = st.selectbox("Choose X-axis column (single)", options=[""] + cols, key=f"x_{safe_key}")
+            y_cols = st.multiselect("Choose Y-axis column(s) (one or more)", options=cols, default=None, key=f"y_{safe_key}")
 
-            # Show existing saved config if present
+            # show existing
             existing = st.session_state["axis_config"].get(chosen_sheet_key)
             if existing:
                 st.caption("Saved config for this sheet:")
                 st.write(existing)
 
-            # Save/delete config controls
             c1, c2 = st.columns([1, 1])
             with c1:
-                if st.button("Save axis config for this sheet", key=f"save_axis_{chosen_sheet_key}"):
+                if st.button("Save axis config for this sheet", key=f"save_axis_{safe_key}"):
                     if not x_col or not y_cols:
                         st.warning("Select both X and at least one Y column before saving.")
                     else:
                         st.session_state["axis_config"][chosen_sheet_key] = {"x_col": x_col, "y_cols": y_cols}
                         st.success("Axis configuration saved.")
             with c2:
-                if st.button("Remove saved config for this sheet", key=f"remove_axis_{chosen_sheet_key}"):
+                if st.button("Remove saved config for this sheet", key=f"remove_axis_{safe_key}"):
                     if chosen_sheet_key in st.session_state["axis_config"]:
                         del st.session_state["axis_config"][chosen_sheet_key]
                         st.success("Removed saved configuration.")
 
-            # Preview the chart immediately if both chosen
+            # Immediate preview if chosen
             if x_col and y_cols:
                 try:
                     preview_df = df[[x_col] + y_cols].copy()
                     for yc in y_cols:
                         preview_df[yc] = pd.to_numeric(preview_df[yc], errors="coerce")
-                    # Choose a default chart type (line if x is time-like or numeric, else bar); keep simple — line
-                    fig = px.line(preview_df, x=x_col, y=y_cols, markers=True, title=f"Preview: {fname} / {sname} — X: {x_col} Y: {', '.join(y_cols)}")
+                    fig = px.line(preview_df, x=x_col, y=y_cols, markers=True,
+                                  title=f"Preview: {Path(fname).stem}/{sname} — X: {x_col} Y: {', '.join(y_cols)}",
+                                  color_discrete_sequence=PALETTE)
                     st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": True, "scrollZoom": True})
                     st.download_button("Download preview chart HTML", data=pio.to_html(fig, full_html=True),
                                        file_name=f"{Path(fname).stem}_{sname}_preview_chart.html", mime="text/html")
                 except Exception as e:
                     st.warning(f"Could not render preview chart: {e}")
 
-    # Generate: use saved axis_config if present, otherwise use auto heuristics
+    # GENERATE: use stored axis_config if present; otherwise auto heuristics
     if generate:
-        chosen = st.session_state.get("chosen_for_report", []) or []
-        if not chosen:
+        if not chosen_files:
             st.error("No files selected for the report. Pick files in the sidebar.")
         else:
             try:
-                # gather sheets same as above
                 data_for_report = {}
-                for fname in chosen:
+                for fname in chosen_files:
                     p = UPLOAD_DIR / fname
                     if not p.exists():
                         st.warning(f"Skipping missing {fname}")
@@ -134,21 +140,19 @@ with tabs[1]:
                             cfg = st.session_state.get("axis_config", {}).get(sheet_key)
 
                             if cfg:
-                                # use configured axes
+                                # embed chart using configured axes
                                 x = cfg["x_col"]
                                 ys = cfg["y_cols"]
-                                # compute row count
-                                r0, r1 = 0, max(0, len(df)-1)
                                 try:
-                                    # attempt to add a line chart (works for numeric y)
                                     chart = workbook.add_chart({"type": "line"})
+                                    rcount = max(1, len(df))
                                     for col in ys:
                                         try:
                                             col_idx = list(df.columns).index(col)
                                             chart.add_series({
                                                 "name": [safe_name, 0, col_idx],
-                                                "categories": [safe_name, 1, list(df.columns).index(x), 1 + r1, list(df.columns).index(x)],
-                                                "values": [safe_name, 1, col_idx, 1 + r1, col_idx],
+                                                "categories": [safe_name, 1, list(df.columns).index(x), 1 + rcount - 1, list(df.columns).index(x)],
+                                                "values": [safe_name, 1, col_idx, 1 + rcount - 1, col_idx],
                                             })
                                         except Exception:
                                             continue
@@ -158,7 +162,7 @@ with tabs[1]:
                                 except Exception as e:
                                     st.warning(f"Failed to embed custom chart for {safe_name}: {e}")
                             else:
-                                # fallback to auto heuristics (existing implementation)
+                                # fallback to auto heuristics (same as preview logic)
                                 num_cols = df.select_dtypes(include=["number"]).columns.tolist()
                                 cat_cols = df.select_dtypes(include=["object", "category"]).columns.tolist()
                                 if "Month" in df.columns and num_cols:
