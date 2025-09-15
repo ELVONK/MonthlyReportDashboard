@@ -6,6 +6,8 @@ from pathlib import Path
 import re, time, uuid, json
 import shutil
 import xlsxwriter
+import plotly.express as px
+import plotly.io as pio
 
 # ---------------------
 # Page config & theme CSS
@@ -426,9 +428,34 @@ with tabs[2]:
         x_col = st.selectbox("Choose X-axis column (typically Month or Category)", options=[""] + cols)
         y_cols = st.multiselect("Choose one or more series columns (numeric)", options=cols)
 
-        # row range controls
-        max_rows = max(1, len(df))
-        r1, r2 = st.slider("Row range (1-indexed)", min_value=1, max_value=max_rows, value=(1, max_rows))
+        # ===== ROBUST ROW-RANGE SLIDER =====
+        try:
+            max_rows = int(max(1, len(df)))  # ensure int and at least 1
+        except Exception:
+            max_rows = 1
+
+        # safe defaults
+        default_low = 1
+        default_high = max_rows
+
+        if default_high < default_low:
+            default_high = default_low
+
+        default_low = int(default_low)
+        default_high = int(default_high)
+
+        try:
+            r1, r2 = st.slider(
+                "Row range (1-indexed)",
+                min_value=1,
+                max_value=max_rows,
+                value=(default_low, default_high),
+                step=1,
+            )
+        except Exception as slider_err:
+            st.warning(f"Could not show row-range slider (using full range). Details: {slider_err}")
+            r1, r2 = 1, max_rows
+        # ===== END ROBUST SLIDER =====
 
         chart_config = {
             'fname': fname,
@@ -437,6 +464,43 @@ with tabs[2]:
             'y_cols': y_cols,
             'row_range': (r1 - 1, r2 - 1),
         }
+
+        # ===== Chart Preview (interactive) =====
+        if x_col and y_cols:
+            try:
+                preview_df = df.iloc[chart_config['row_range'][0]:chart_config['row_range'][1] + 1]
+                # attempt to coerce y cols to numeric where possible
+                for yc in y_cols:
+                    preview_df[yc] = pd.to_numeric(preview_df[yc], errors='coerce')
+
+                fig = px.line(preview_df, x=x_col, y=y_cols, markers=True, title=f"Preview: {fname} / {sname}")
+                st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': True, 'scrollZoom': True})
+
+                # Offer HTML download which opens fullscreen in browser and can be printed
+                html = pio.to_html(fig, full_html=True)
+                st.download_button(
+                    label="Download chart as HTML (open in browser to view fullscreen/print)",
+                    data=html,
+                    file_name=f"{Path(fname).stem}_{sname}_chart.html",
+                    mime='text/html',
+                )
+
+                # Offer PNG download if plotly can render it (kaleido required)
+                try:
+                    img_bytes = fig.to_image(format='png')
+                    st.download_button(
+                        label="Download chart as PNG",
+                        data=img_bytes,
+                        file_name=f"{Path(fname).stem}_{sname}_chart.png",
+                        mime='image/png',
+                    )
+                except Exception:
+                    st.caption("PNG export unavailable (install 'kaleido' to enable PNG export).")
+
+            except Exception as e:
+                st.warning(f"Could not render chart preview: {e}")
+        else:
+            st.info("Choose an X column and at least one series column to preview the chart.")
 
     def gather_data_for_report(selected_files: list) -> dict:
         if not selected_files:
@@ -514,14 +578,11 @@ with tabs[2]:
                             r0, r1 = chart_config['row_range']
                             if x and ys:
                                 try:
-                                    # write a small helper sheet for chart data if needed
                                     chart_sheet = safe_name
-                                    worksheet = writer.sheets.get(chart_sheet) or writer.book.add_worksheet(chart_sheet)
-                                    # Ensure data is in the sheet (it already is from to_excel above)
-                                    # Build chart using positions based on rows selected
+                                    # writer already wrote the sheet above; build chart referencing the same sheet
                                     chart = workbook.add_chart({'type': 'line'})
-                                    # compute row offsets: header at row 0, data starts row 1
-                                    for i, col in enumerate(df.columns, start=0):
+                                    # compute header and column indexes based on df
+                                    for i, col in enumerate(df.columns):
                                         if col == x:
                                             x_col_idx = i
                                     for col in ys:
@@ -536,7 +597,10 @@ with tabs[2]:
                                             continue
                                     chart.set_title({'name': f"{safe_name} - Custom Chart"})
                                     chart.set_x_axis({'name': x})
-                                    worksheet.insert_chart('G2', chart)
+                                    # insert chart into the same sheet
+                                    worksheet = writer.sheets.get(chart_sheet)
+                                    if worksheet:
+                                        worksheet.insert_chart('G2', chart)
                                 except Exception as e:
                                     st.warning(f"Failed to add custom chart for {safe_name}: {e}")
 
