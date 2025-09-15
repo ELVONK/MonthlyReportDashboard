@@ -4,3 +4,4 @@ plotly>=5.0.0
 xlsxwriter
 openpyxl
 xlrd
+kaleido
