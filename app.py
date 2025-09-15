@@ -137,6 +137,10 @@ def save_mappings(d: dict):
 DEPARTMENTS = ["Supply Chain","Human Resources","Road Assets","Transport","Survey","Finance"]
 PALETTE = ["#D4AF37", "#2E7D32", "#263238", "#F6E27A", "#9CCC65"]
 
+# Ensure session_state keys exist
+if 'custom_config' not in st.session_state:
+    st.session_state['custom_config'] = None
+
 # ---------------------
 # Sidebar
 # ---------------------
@@ -163,12 +167,12 @@ with st.sidebar:
     if saved_df.empty:
         st.info("No saved files yet.")
         saved_options = []
-        chosen_for_report = []
-        chosen_for_mapping = ""
     else:
         saved_options = saved_df.sort_values("modified", ascending=False)["file"].tolist()
-        chosen_for_report = st.multiselect("Files to include in report", options=saved_options, default=None)
-        chosen_for_mapping = st.selectbox("File to map/preview", options=[""] + saved_options)
+
+    # Use a named key so it's accessible from other parts of the app
+    chosen_for_report = st.multiselect("Files to include in report", options=saved_options, default=None, key='chosen_for_report')
+    chosen_for_mapping = st.selectbox("File to map/preview", options=[""] + saved_options, key='chosen_for_mapping')
 
     st.markdown("---")
     if st.button("Open Reports Folder (in app) "):
@@ -181,7 +185,7 @@ mappings = load_mappings()
 
 tabs = st.tabs(["Preview", "Mappings", "Generate Report", "Past Reports"])
 
-# ----- Preview tab: now includes auto analysis per saved sheet -----
+# ----- Preview tab: includes auto analysis per saved sheet -----
 with tabs[0]:
     st.header("Preview files & Auto Analysis")
     st.markdown("Preview session uploads or saved files — the app will also run a quick analysis and draw auto-charts.")
@@ -207,7 +211,6 @@ with tabs[0]:
         # Auto-chart heuristics
         fig = None
         if 'Month' in df.columns and num_cols:
-            # multi-series line over Month
             try:
                 plot_df = df[['Month'] + num_cols].copy()
                 for c in num_cols:
@@ -216,14 +219,12 @@ with tabs[0]:
             except Exception:
                 fig = None
         elif num_cols and cat_cols:
-            # bar: first categorical vs first numeric (aggregate)
             try:
                 agg = df.groupby(cat_cols[0])[num_cols[0]].sum().reset_index()
                 fig = px.bar(agg, x=cat_cols[0], y=num_cols[0], title=f"Auto: {title} — {num_cols[0]} by {cat_cols[0]}", color_discrete_sequence=PALETTE)
             except Exception:
                 fig = None
         elif num_cols:
-            # line of the first numeric column index order
             try:
                 plot_df = df[num_cols].copy()
                 plot_df = plot_df.apply(pd.to_numeric, errors='coerce')
@@ -284,7 +285,9 @@ with tabs[0]:
 with tabs[1]:
     st.header("Column -> Department Mapping")
     st.markdown("Create or edit mappings that tell the generator how to place columns into department sheets.")
-    file_for_map = st.selectbox("Choose a saved file to create/edit mapping", options=[""] + saved_options if (saved_options := list_saved_files(UPLOAD_DIR).sort_values('modified', ascending=False)['file'].tolist()) else [""])
+    saved_opts_df = list_saved_files(UPLOAD_DIR)
+    saved_opts = saved_opts_df.sort_values('modified', ascending=False)['file'].tolist() if not saved_opts_df.empty else []
+    file_for_map = st.selectbox("Choose a saved file to create/edit mapping", options=[""] + saved_opts, key='file_for_map')
     if file_for_map:
         p = UPLOAD_DIR / file_for_map
         try:
@@ -297,7 +300,7 @@ with tabs[1]:
                 engine_kw = _choose_excel_engine_from_filename(file_for_map)
                 xls = pd.ExcelFile(BytesIO(fb), **engine_kw)
                 sheet_list = xls.sheet_names
-                chosen_sheet = st.selectbox("Select sheet to inspect for columns", sheet_list)
+                chosen_sheet = st.selectbox("Select sheet to inspect for columns", sheet_list, key=f"map_sheet_{file_for_map}")
                 df_full = pd.read_excel(BytesIO(fb), sheet_name=chosen_sheet, **engine_kw)
             if not df_full.empty:
                 cols = list(df_full.columns)
@@ -335,13 +338,14 @@ with tabs[2]:
     base_name = st.text_input("Base report filename", value="Department_Report_with_Charts")
     generate = st.button("Generate Report")
 
-    # Chart customization UI (as before)
+    # Chart customization UI (as before) but fixed: uses sidebar-chosen files and session_state to persist
     st.markdown('---')
     st.subheader('Optional: Custom chart for one sheet')
+
+    # use chosen_for_report from sidebar (stored in session_state)
+    chosen_for_report = st.session_state.get('chosen_for_report', [])
+
     available_sheets = {}
-    saved_files = list_saved_files(UPLOAD_DIR).sort_values('modified', ascending=False)
-    saved_list = saved_files['file'].tolist() if not saved_files.empty else []
-    # build available_sheets for chosen files
     def gather_available_sheets(selected_files: list) -> dict:
         out = {}
         for fname in (selected_files or []):
@@ -362,9 +366,7 @@ with tabs[2]:
                 continue
         return out
 
-    chosen_for_report = st.sidebar.multiselect("Choose saved file(s) to include in the report", options=saved_list, default=None)
     available_sheets = gather_available_sheets(chosen_for_report)
-
     sheet_choices = []
     sheet_map = {}
     for fname, sheets in available_sheets.items():
@@ -373,51 +375,61 @@ with tabs[2]:
             sheet_choices.append(key)
             sheet_map[key] = (fname, sname)
 
-    custom_sheet = st.selectbox('Custom chart - pick a sheet (optional)', options=[""] + sheet_choices)
-    custom_config = {}
+    custom_sheet = st.selectbox('Custom chart - pick a sheet (optional)', options=[""] + sheet_choices, key='custom_sheet')
+
+    # Show stored custom config if present
+    if st.session_state.get('custom_config'):
+        st.caption('Saved custom chart config found — it will be applied when generating the report.')
+        st.json(st.session_state['custom_config'])
+
+    custom_config = None
     if custom_sheet:
         fname, sname = sheet_map[custom_sheet]
         df = available_sheets[fname][sname]
         st.markdown(f"Preview of {fname} / {sname}")
         st.dataframe(df.head(10), use_container_width=True)
         cols = list(df.columns)
-        chart_type = st.selectbox("Chart type", options=["Line", "Bar", "Pie"], index=0)
-        x_col = st.selectbox("X column", options=[""] + cols)
+        # make keys unique per sheet to avoid widget collisions
+        safe_key = re.sub(r"[^0-9a-zA-Z]+", "_", custom_sheet)
+        chart_type = st.selectbox("Chart type", options=["Line", "Bar", "Pie"], index=0, key=f"chart_type_{safe_key}")
+        x_col = st.selectbox("X column", options=[""] + cols, key=f"xcol_{safe_key}")
         if chart_type == 'Pie':
-            y_cols = st.selectbox("Value column (single)", options=[""] + cols)
-            y_cols = [y_cols] if y_cols else []
+            y_col_single = st.selectbox("Value column (single)", options=[""] + cols, key=f"ycol_single_{safe_key}")
+            y_cols = [y_col_single] if y_col_single else []
         else:
-            y_cols = st.multiselect("Series columns", options=cols)
+            y_cols = st.multiselect("Series columns", options=cols, key=f"ycols_{safe_key}")
         # styling
-        color_scheme = st.selectbox("Color scheme", options=["Gold & Green", "Default"], index=0)
+        color_scheme = st.selectbox("Color scheme", options=["Gold & Green", "Default"], index=0, key=f"color_{safe_key}")
         colors = PALETTE if color_scheme == 'Gold & Green' else None
-        smoothing = st.checkbox('Smooth line ( spline )', value=False) if chart_type == 'Line' else False
-        stacked = st.checkbox('Stack bars', value=False) if chart_type == 'Bar' else False
+        smoothing = st.checkbox('Smooth line ( spline )', value=False, key=f"smooth_{safe_key}") if chart_type == 'Line' else False
+        stacked = st.checkbox('Stack bars', value=False, key=f"stack_{safe_key}") if chart_type == 'Bar' else False
         # robust slider
         try:
             max_rows = int(max(1, len(df)))
         except Exception:
             max_rows = 1
         try:
-            r1, r2 = st.slider('Row range (1-indexed)', min_value=1, max_value=max_rows, value=(1, max_rows), step=1)
+            r1, r2 = st.slider('Row range (1-indexed)', min_value=1, max_value=max_rows, value=(1, max_rows), step=1, key=f"rows_{safe_key}")
         except Exception:
             r1, r2 = 1, max_rows
-        custom_config = {'fname': fname, 'sname': sname, 'chart_type': chart_type, 'x_col': x_col, 'y_cols': y_cols, 'row_range': (r1 - 1, r2 - 1), 'colors': colors, 'smoothing': smoothing, 'stacked': stacked}
-        # show preview (Plotly)
+
+        tmp_config = {'fname': fname, 'sname': sname, 'chart_type': chart_type, 'x_col': x_col, 'y_cols': y_cols, 'row_range': (r1 - 1, r2 - 1), 'colors': colors, 'smoothing': smoothing, 'stacked': stacked}
+
+        # preview
         if x_col and y_cols:
             try:
-                preview_df = df.iloc[custom_config['row_range'][0]:custom_config['row_range'][1] + 1].copy()
-                for yc in custom_config['y_cols']:
+                preview_df = df.iloc[tmp_config['row_range'][0]:tmp_config['row_range'][1] + 1].copy()
+                for yc in tmp_config['y_cols']:
                     preview_df[yc] = pd.to_numeric(preview_df[yc], errors='coerce')
                 if chart_type == 'Pie':
-                    fig = px.pie(preview_df, names=custom_config['x_col'], values=custom_config['y_cols'][0], color_discrete_sequence=custom_config['colors'])
+                    fig = px.pie(preview_df, names=tmp_config['x_col'], values=tmp_config['y_cols'][0], color_discrete_sequence=tmp_config['colors'])
                 elif chart_type == 'Bar':
-                    fig = px.bar(preview_df, x=custom_config['x_col'], y=custom_config['y_cols'], color_discrete_sequence=custom_config['colors'])
-                    if custom_config['stacked']:
+                    fig = px.bar(preview_df, x=tmp_config['x_col'], y=tmp_config['y_cols'], color_discrete_sequence=tmp_config['colors'])
+                    if tmp_config['stacked']:
                         fig.update_layout(barmode='stack')
                 else:
-                    shape = 'spline' if custom_config['smoothing'] else 'linear'
-                    fig = px.line(preview_df, x=custom_config['x_col'], y=custom_config['y_cols'], line_shape=shape, markers=True, color_discrete_sequence=custom_config['colors'])
+                    shape = 'spline' if tmp_config['smoothing'] else 'linear'
+                    fig = px.line(preview_df, x=tmp_config['x_col'], y=tmp_config['y_cols'], line_shape=shape, markers=True, color_discrete_sequence=tmp_config['colors'])
                 st.plotly_chart(fig, use_container_width=True)
                 st.download_button('Download custom chart as HTML', data=pio.to_html(fig, full_html=True), file_name=f"{Path(fname).stem}_{sname}_custom.html", mime='text/html')
             except Exception as e:
@@ -425,7 +437,16 @@ with tabs[2]:
         else:
             st.info('Select X and Y columns to preview the custom chart')
 
-    # When generating: write all sheets and embed charts
+        # allow user to save custom config so it persists across reruns
+        if st.button('Save custom chart configuration', key=f"savecfg_{safe_key}"):
+            st.session_state['custom_config'] = tmp_config
+            st.success('Custom chart configuration saved — it will be embedded when you generate the report.')
+        custom_config = st.session_state.get('custom_config')
+
+    else:
+        custom_config = st.session_state.get('custom_config')
+
+    # When generating: write all sheets and embed charts (apply saved custom_config if present)
     if generate:
         try:
             data_for_report = {}
@@ -460,19 +481,21 @@ with tabs[2]:
                             try:
                                 df.to_excel(writer, sheet_name=safe_name, index=False)
                             except Exception:
-                                # fallback: write a truncated version
                                 df.head(1000).to_excel(writer, sheet_name=safe_name, index=False)
                             worksheet = writer.sheets[safe_name]
 
-                            # Insert chart: if custom_config applies to this sheet, use it; else auto-generate
-                            applied_custom = custom_config and custom_config.get('fname') == fname and custom_config.get('sname') == sname
-                            if applied_custom:
-                                cfg = custom_config
-                                x = cfg['x_col']
-                                ys = cfg['y_cols']
-                                r0, r1 = cfg['row_range']
-                                ctype = cfg['chart_type']
+                            # Determine whether to apply custom config
+                            applied_custom = False
+                            cfg = st.session_state.get('custom_config')
+                            if cfg and cfg.get('fname') == fname and cfg.get('sname') == sname:
+                                applied_custom = True
+
+                            if applied_custom and cfg:
                                 try:
+                                    x = cfg['x_col']
+                                    ys = cfg['y_cols']
+                                    r0, r1 = cfg['row_range']
+                                    ctype = cfg['chart_type']
                                     if ctype in ('Line', 'Bar') and ys:
                                         chart = workbook.add_chart({'type': 'line' if ctype == 'Line' else 'column'})
                                         for col in ys:
@@ -527,9 +550,7 @@ with tabs[2]:
                                         pass
                                 elif num_cols and cat_cols:
                                     try:
-                                        # aggregate first numeric by first category
                                         agg = df.groupby(cat_cols[0])[num_cols[0]].sum().reset_index()
-                                        # write agg to a helper sheet and chart it
                                         help_name = (safe_name + '_agg')[:31]
                                         agg.to_excel(writer, sheet_name=help_name, index=False)
                                         help_ws = writer.sheets[help_name]
