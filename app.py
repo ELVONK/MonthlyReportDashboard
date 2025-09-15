@@ -24,7 +24,6 @@ try:
     HAS_XLRD = True
 except Exception:
     HAS_XLRD = False
-    # xlrd is only required for older .xls — pandas may also use other engines
     missing_deps.append("xlrd (optional for .xls)")
 
 # ---------------------
@@ -71,16 +70,30 @@ def read_file_bytes_from_disk(path: Path) -> bytes:
         return f.read()
 
 
-def read_excel_sheets_from_bytes(file_bytes: bytes) -> list:
-    if not HAS_OPENPYXL:
-        raise ImportError("openpyxl not installed")
-    return pd.ExcelFile(BytesIO(file_bytes), engine="openpyxl").sheet_names
+def _choose_excel_engine_from_filename(fname: str) -> dict:
+    """Return kwargs for pandas read functions with engine choice based on filename."""
+    fname = fname.lower()
+    if fname.endswith('.xlsx'):
+        if not HAS_OPENPYXL:
+            raise ImportError('openpyxl not installed')
+        return {'engine': 'openpyxl'}
+    if fname.endswith('.xls'):
+        if not HAS_XLRD:
+            raise ImportError('xlrd not installed')
+        return {'engine': 'xlrd'}
+    # fallback: no explicit engine
+    return {}
 
 
-def read_excel_preview_from_bytes(file_bytes: bytes, sheet_name: str, nrows: int = 15) -> pd.DataFrame:
-    if not HAS_OPENPYXL:
-        raise ImportError("openpyxl not installed")
-    return pd.read_excel(BytesIO(file_bytes), sheet_name=sheet_name, nrows=nrows, engine="openpyxl")
+def read_excel_sheets_from_bytes(file_bytes: bytes, fname: str) -> list:
+    """Return sheet names for xls/xlsx using the appropriate engine."""
+    engine_kw = _choose_excel_engine_from_filename(fname)
+    return pd.ExcelFile(BytesIO(file_bytes), **engine_kw).sheet_names
+
+
+def read_excel_preview_from_bytes(file_bytes: bytes, sheet_name: str, fname: str, nrows: int = 15) -> pd.DataFrame:
+    engine_kw = _choose_excel_engine_from_filename(fname)
+    return pd.read_excel(BytesIO(file_bytes), sheet_name=sheet_name, nrows=nrows, **engine_kw)
 
 
 def load_mappings() -> dict:
@@ -199,16 +212,19 @@ with tabs[0]:
                         st.dataframe(pd.read_csv(BytesIO(fb), nrows=30), use_container_width=True)
                     elif uf.name.lower().endswith('.xls'):
                         try:
-                            st.dataframe(pd.read_excel(BytesIO(fb), sheet_name=0, nrows=30), use_container_width=True)
+                            engine_kw = _choose_excel_engine_from_filename(uf.name)
+                            st.dataframe(pd.read_excel(BytesIO(fb), sheet_name=0, nrows=30, **engine_kw), use_container_width=True)
                         except Exception as e:
                             st.error(f"Preview failed (.xls): {e}")
                     else:
-                        if not HAS_OPENPYXL:
-                            st.error("Cannot preview .xlsx: openpyxl not installed")
-                        else:
-                            sheets = read_excel_sheets_from_bytes(fb)
+                        try:
+                            sheets = read_excel_sheets_from_bytes(fb, uf.name)
                             sheet = st.selectbox(f"Sheet ({uf.name})", sheets, key=f"sess_{uf.name}")
-                            st.dataframe(read_excel_preview_from_bytes(fb, sheet, nrows=50), use_container_width=True)
+                            st.dataframe(read_excel_preview_from_bytes(fb, sheet, uf.name, nrows=50), use_container_width=True)
+                        except ImportError:
+                            st.error("Cannot preview .xlsx: openpyxl not installed")
+                        except Exception as e:
+                            st.error(e)
                 except Exception as e:
                     st.error(e)
     else:
@@ -226,16 +242,19 @@ with tabs[0]:
                         st.dataframe(pd.read_csv(BytesIO(fb), nrows=50), use_container_width=True)
                     elif fname.lower().endswith('.xls'):
                         try:
-                            st.dataframe(pd.read_excel(BytesIO(fb), sheet_name=0, nrows=50), use_container_width=True)
+                            engine_kw = _choose_excel_engine_from_filename(fname)
+                            st.dataframe(pd.read_excel(BytesIO(fb), sheet_name=0, nrows=50, **engine_kw), use_container_width=True)
                         except Exception as e:
                             st.error(f"Preview failed (.xls): {e}")
                     else:
-                        if not HAS_OPENPYXL:
-                            st.error("Cannot preview .xlsx: openpyxl not installed")
-                        else:
-                            sheets = read_excel_sheets_from_bytes(fb)
+                        try:
+                            sheets = read_excel_sheets_from_bytes(fb, fname)
                             sheet = st.selectbox(f"Sheet ({fname})", sheets, key=f"saved_{fname}")
-                            st.dataframe(read_excel_preview_from_bytes(fb, sheet, nrows=50), use_container_width=True)
+                            st.dataframe(read_excel_preview_from_bytes(fb, sheet, fname, nrows=50), use_container_width=True)
+                        except ImportError:
+                            st.error("Cannot preview .xlsx: openpyxl not installed")
+                        except Exception as e:
+                            st.error(f"Could not preview {fname}: {e}")
                 except Exception as e:
                     st.error(f"Could not read {fname}: {e}")
     else:
@@ -256,17 +275,13 @@ with tabs[1]:
             if file_for_map.lower().endswith('.csv'):
                 df_full = pd.read_csv(BytesIO(fb))
                 sheet_list = ["(csv)"]
+                chosen_sheet = sheet_list[0]
             else:
-                if not HAS_OPENPYXL and file_for_map.lower().endswith('.xlsx'):
-                    st.error("openpyxl required to edit mapping for .xlsx")
-                    df_full = pd.DataFrame()
-                    sheet_list = []
-                else:
-                    # try to read first sheet for mapping context, but allow selecting others
-                    xls = pd.ExcelFile(BytesIO(fb), engine=("openpyxl" if file_for_map.lower().endswith('.xlsx') else None))
-                    sheet_list = xls.sheet_names
-                    chosen_sheet = st.selectbox("Select sheet to inspect for columns", sheet_list)
-                    df_full = pd.read_excel(BytesIO(fb), sheet_name=chosen_sheet, engine=("openpyxl" if file_for_map.lower().endswith('.xlsx') else None))
+                engine_kw = _choose_excel_engine_from_filename(file_for_map)
+                xls = pd.ExcelFile(BytesIO(fb), **engine_kw)
+                sheet_list = xls.sheet_names
+                chosen_sheet = st.selectbox("Select sheet to inspect for columns", sheet_list)
+                df_full = pd.read_excel(BytesIO(fb), sheet_name=chosen_sheet, **engine_kw)
 
             if not df_full.empty:
                 st.markdown("**Columns detected:**")
@@ -274,16 +289,20 @@ with tabs[1]:
                 st.write(cols)
 
                 # load existing mapping for this file (by filename + sheet)
-                map_key = f"{file_for_map}::{sheet_list[0] if len(sheet_list)==1 else chosen_sheet}"
+                map_key = f"{file_for_map}::{chosen_sheet}"
                 current_map = mappings.get(map_key, {})
 
                 st.markdown("---")
                 st.markdown("**Assign columns to departments**")
                 new_map = {}
                 for c in cols:
-                    # default: existing mapping or blank
                     default = current_map.get(c, "")
-                    target = st.selectbox(f"Column: {c}", options=["", *DEPARTMENTS], index=(0 if default=="" else DEPARTMENTS.index(default)+1 if default in DEPARTMENTS else 0), key=f"map_{map_key}_{c}")
+                    # compute default index safely
+                    try:
+                        idx = 0 if default == "" else (DEPARTMENTS.index(default) + 1)
+                    except Exception:
+                        idx = 0
+                    target = st.selectbox(f"Column: {c}", options=["", *DEPARTMENTS], index=idx, key=f"map_{map_key}_{c}")
                     if target:
                         new_map[c] = target
 
@@ -297,6 +316,8 @@ with tabs[1]:
                     st.markdown("**Current mapping preview**")
                     st.json(current_map)
 
+        except ImportError as ie:
+            st.error(str(ie))
         except Exception as e:
             st.error(f"Failed to open file for mapping: {e}")
     else:
@@ -328,31 +349,25 @@ with tabs[2]:
                 if fname.lower().endswith('.csv'):
                     df = pd.read_csv(BytesIO(fb))
                     out[fname[:25]] = df
-                elif fname.lower().endswith('.xls'):
-                    xls = pd.ExcelFile(BytesIO(fb))
-                    for s in xls.sheet_names:
-                        df = pd.read_excel(BytesIO(fb), sheet_name=s)
-                        out[f"{Path(fname).stem[:20]}_{s[:8]}"] = df
-                else:  # xlsx
-                    if not HAS_OPENPYXL:
-                        st.error(f"Cannot read {fname}: openpyxl missing")
+                elif fname.lower().endswith('.xls') or fname.lower().endswith('.xlsx'):
+                    try:
+                        engine_kw = _choose_excel_engine_from_filename(fname)
+                    except ImportError as ie:
+                        st.error(str(ie))
                         continue
-                    xls = pd.ExcelFile(BytesIO(fb), engine="openpyxl")
+                    xls = pd.ExcelFile(BytesIO(fb), **engine_kw)
                     for s in xls.sheet_names:
-                        df = pd.read_excel(BytesIO(fb), sheet_name=s, engine="openpyxl")
+                        df = pd.read_excel(BytesIO(fb), sheet_name=s, **engine_kw)
                         out[f"{Path(fname).stem[:20]}_{s[:8]}"] = df
+                else:
+                    st.warning(f"Unsupported file type: {fname}")
             except Exception as e:
                 st.warning(f"Failed to read {fname}: {e}")
         return out
 
     if generate:
         try:
-            # read chosen files from sidebar variable `chosen_for_report` (may not exist if none)
-            try:
-                chosen = st.session_state.get('multiselect', None)
-            except Exception:
-                chosen = None
-            # better: read files directly from the sidebar variable if present
+            # read chosen files from sidebar variable `chosen_for_report`
             try:
                 chosen = chosen_for_report  # from sidebar scope
             except Exception:
@@ -369,30 +384,26 @@ with tabs[2]:
                 with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:
                     workbook = writer.book
                     for sheet_name, df in data_for_report.items():
-                        safe_name = re.sub(r'[:\\/?*\[\]]', "_", str(sheet_name))[:31]
-                        # apply mapping: if mappings exist for this originating file/sheet, group columns into department sheets
-                        # simple approach: if any mapping matches this sheet's key, build per-department dfs
+                        safe_name = re.sub(r'[:\/?*\[\]]', "_", str(sheet_name))[:31]
+
+                        # apply mapping: look for mapping keys that match originating file (prefix match)
                         assigned = False
-                        # find mapping keys that reference this source by filename prefix
                         for k, mp in mappings.items():
-                            # k is file::sheet
-                            if k.split('::')[0].startswith(sheet_name.split('_')[0]):
-                                # apply mapping
+                            # mapping key format: filename::sheet
+                            fname_key = k.split('::')[0]
+                            if fname_key in sheet_name:
                                 dept_groups = {}
                                 for col, dep in mp.items():
                                     if col in df.columns:
                                         dept_groups.setdefault(dep, []).append(col)
-                                # write each department frame
                                 for dep, cols in dept_groups.items():
                                     subdf = df[cols]
-                                    writer.sheets  # ensure writer initialized
                                     sub_name = (dep[:22] + "_" + safe_name[:6])[:31]
                                     subdf.to_excel(writer, sheet_name=sub_name, index=False)
                                 assigned = True
                                 break
 
                         if not assigned:
-                            # default behavior: write the dataframe as-is
                             df.to_excel(writer, sheet_name=safe_name, index=False)
 
                         # add simple chart if Month present
