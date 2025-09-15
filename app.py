@@ -4,9 +4,75 @@ import pandas as pd
 from io import BytesIO
 from pathlib import Path
 import re, time, uuid, json
+import shutil
 import xlsxwriter
 
+# ---------------------
+# Page config & theme CSS
+# ---------------------
 st.set_page_config(page_title="Monthly Report Dashboard", layout="wide")
+
+# -- color palette (yellow, gold, green) applied via CSS --
+_THEME_CSS = """
+:root{
+  --brand-yellow: #FFF8E1; /* very light yellow background */
+  --brand-gold: #D4AF37;   /* gold for buttons and accents */
+  --brand-green: #2E7D32;  /* green for success and highlights */
+  --brand-dark: #263238;   /* dark text */
+}
+
+/* Page background */
+.reportview-container, .main, .block-container {
+  background-color: var(--brand-yellow) !important;
+}
+
+/* Title area */
+header .css-1v3fvcr { background: linear-gradient(90deg, var(--brand-gold), var(--brand-green)); }
+
+/* Card / container shadows */
+.stBlock { box-shadow: 0 6px 18px rgba(0,0,0,0.06); border-radius: 12px; }
+
+/* Buttons (primary actions) */
+.stButton>button, .stDownloadButton>button {
+  background: linear-gradient(180deg, var(--brand-gold), #b58f2c) !important;
+  color: white !important;
+  border: none !important;
+  padding: 0.6rem 1rem !important;
+  border-radius: 10px !important;
+  font-weight: 600 !important;
+}
+.stButton>button:hover, .stDownloadButton>button:hover { filter: brightness(0.95); }
+
+/* Secondary buttons (archive/delete) */
+.stButton>button.secondary { background: #E0E0E0 !important; color: var(--brand-dark); }
+
+/* Sidebar styling */
+section[data-testid="stSidebar"] { background: linear-gradient(180deg, #fffbe6, #f7f3e6) !important; border-right: 1px solid rgba(0,0,0,0.04); }
+
+/* Expander headers */
+div[data-baseweb="accordion"] > div > div:first-child { background: #fff8e6 !important; border-radius: 8px; }
+
+/* Tables and dataframes */
+.css-1d391kg { border-radius: 8px; }
+
+/* Make inputs stand out slightly */
+.stTextInput>div>div>input, .stSelectbox>div>div>div>select, textarea {
+  border-radius: 8px !important; border: 1px solid rgba(0,0,0,0.08) !important; padding: 8px !important;
+}
+
+/* Success messages in green */
+.stAlert-success { background-color: rgba(46,125,50,0.08) !important; border-left: 4px solid var(--brand-green) !important; }
+
+/* Small helper for colored captions */
+.brand-caption { color: var(--brand-dark); font-weight: 500; }
+"""
+
+# Inject CSS
+st.markdown(f"<style>{_THEME_CSS}</style>", unsafe_allow_html=True)
+
+# App title (keeps contrast with theme)
+st.markdown("<h1 style='color:#263238;margin-bottom:0.2rem'>Monthly Report Dashboard</h1>", unsafe_allow_html=True)
+st.caption("Preview saved files, map columns to department sheets, and generate auto-named Excel reports.")
 
 # ---------------------
 # Dependency checks
@@ -32,8 +98,9 @@ except Exception:
 BASE_DIR = Path(__file__).parent
 UPLOAD_DIR = BASE_DIR / "uploads"
 REPORT_DIR = BASE_DIR / "reports"
+ARCHIVE_DIR = REPORT_DIR / "archive"
 MAPPINGS_FILE = BASE_DIR / "mappings.json"
-for d in (UPLOAD_DIR, REPORT_DIR):
+for d in (UPLOAD_DIR, REPORT_DIR, ARCHIVE_DIR):
     d.mkdir(parents=True, exist_ok=True)
 
 
@@ -86,7 +153,6 @@ def _choose_excel_engine_from_filename(fname: str) -> dict:
 
 
 def read_excel_sheets_from_bytes(file_bytes: bytes, fname: str) -> list:
-    """Return sheet names for xls/xlsx using the appropriate engine."""
     engine_kw = _choose_excel_engine_from_filename(fname)
     return pd.ExcelFile(BytesIO(file_bytes), **engine_kw).sheet_names
 
@@ -123,30 +189,6 @@ DEPARTMENTS = [
 
 
 # ---------------------
-# Top-level UI: dependency banner + instructions
-# ---------------------
-with st.container():
-    col1, col2 = st.columns([6, 1])
-    with col1:
-        st.title("Monthly Report Dashboard")
-        st.caption("Preview saved files, map columns to department sheets, and generate auto-named Excel reports.")
-    with col2:
-        if missing_deps:
-            st.error("Missing optional deps: " + ", ".join(missing_deps))
-            with st.expander("How to install missing dependencies"):
-                st.markdown("""
-- For `.xlsx` files: `pip install openpyxl`
-- For older `.xls` files: `pip install xlrd`
-
-Add these to your `requirements.txt` before deploying.
-""")
-        else:
-            st.success("All optional dependencies available")
-
-st.markdown("---")
-
-
-# ---------------------
 # Sidebar: Upload, saved files and quick actions
 # ---------------------
 with st.sidebar:
@@ -177,6 +219,8 @@ with st.sidebar:
     if saved_df.empty:
         st.info("No saved files yet.")
         saved_options = []
+        chosen_for_report = []
+        chosen_for_mapping = ""
     else:
         saved_options = saved_df.sort_values("modified", ascending=False)["file"].tolist()
         # allow selecting multiple files for report generation
@@ -306,11 +350,11 @@ with tabs[1]:
                     if target:
                         new_map[c] = target
 
-                if st.button("Save mapping for this sheet"):
-                    mappings[map_key] = new_map
-                    save_mappings(mappings)
-                    st.success("Mapping saved")
-                    st.experimental_rerun()
+                    if st.button("Save mapping for this sheet"):
+                        mappings[map_key] = new_map
+                        save_mappings(mappings)
+                        st.success("Mapping saved")
+                        st.experimental_rerun()
 
                 if current_map:
                     st.markdown("**Current mapping preview**")
@@ -330,6 +374,69 @@ with tabs[2]:
 
     base_name = st.text_input("Base report filename", value="Department_Report_with_Charts")
     generate = st.button("Generate Report (use selected files)")
+
+    # Chart customization area: choose which sheet and which columns/rows to chart
+    st.markdown("---")
+    st.subheader("Chart options (choose sheet, X axis, series, row range)")
+
+    # gather candidates for customization from selected files
+    def gather_available_sheets(selected_files: list) -> dict:
+        out = {}
+        for fname in (selected_files or []):
+            p = UPLOAD_DIR / fname
+            if not p.exists():
+                continue
+            try:
+                fb = read_file_bytes_from_disk(p)
+                if fname.lower().endswith('.csv'):
+                    out[fname] = {'(csv)': pd.read_csv(BytesIO(fb))}
+                else:
+                    try:
+                        engine_kw = _choose_excel_engine_from_filename(fname)
+                    except ImportError:
+                        continue
+                    xls = pd.ExcelFile(BytesIO(fb), **engine_kw)
+                    out[fname] = {}
+                    for s in xls.sheet_names:
+                        out[fname][s] = pd.read_excel(BytesIO(fb), sheet_name=s, **engine_kw)
+            except Exception:
+                continue
+        return out
+
+    available_sheets = gather_available_sheets(chosen_for_report)
+    # Flatten sheet choices for UI
+    sheet_choices = []
+    sheet_map = {}
+    for fname, sheets in available_sheets.items():
+        for sname in sheets.keys():
+            key = f"{fname}::{sname}"
+            sheet_choices.append(key)
+            sheet_map[key] = (fname, sname)
+
+    selected_sheet_for_chart = st.selectbox("Select sheet to configure chart", options=[""] + sheet_choices)
+
+    chart_config = {}
+    if selected_sheet_for_chart:
+        fname, sname = sheet_map[selected_sheet_for_chart]
+        df = available_sheets[fname][sname]
+        st.markdown(f"**Preview of {fname} / {sname} (top 10 rows)**")
+        st.dataframe(df.head(10), use_container_width=True)
+
+        cols = list(df.columns)
+        x_col = st.selectbox("Choose X-axis column (typically Month or Category)", options=[""] + cols)
+        y_cols = st.multiselect("Choose one or more series columns (numeric)", options=cols)
+
+        # row range controls
+        max_rows = max(1, len(df))
+        r1, r2 = st.slider("Row range (1-indexed)", min_value=1, max_value=max_rows, value=(1, max_rows))
+
+        chart_config = {
+            'fname': fname,
+            'sname': sname,
+            'x_col': x_col,
+            'y_cols': y_cols,
+            'row_range': (r1 - 1, r2 - 1),
+        }
 
     def gather_data_for_report(selected_files: list) -> dict:
         if not selected_files:
@@ -367,12 +474,7 @@ with tabs[2]:
 
     if generate:
         try:
-            # read chosen files from sidebar variable `chosen_for_report`
-            try:
-                chosen = chosen_for_report  # from sidebar scope
-            except Exception:
-                chosen = None
-
+            chosen = chosen_for_report
             data_for_report = gather_data_for_report(chosen)
 
             if not data_for_report:
@@ -389,7 +491,6 @@ with tabs[2]:
                         # apply mapping: look for mapping keys that match originating file (prefix match)
                         assigned = False
                         for k, mp in mappings.items():
-                            # mapping key format: filename::sheet
                             fname_key = k.split('::')[0]
                             if fname_key in sheet_name:
                                 dept_groups = {}
@@ -406,20 +507,38 @@ with tabs[2]:
                         if not assigned:
                             df.to_excel(writer, sheet_name=safe_name, index=False)
 
-                        # add simple chart if Month present
-                        if "Month" in df.columns and df.shape[0] > 0 and df.shape[1] > 1:
-                            try:
-                                worksheet = writer.sheets.get(safe_name) or writer.book.add_worksheet(safe_name)
-                                chart = workbook.add_chart({"type": "line"})
-                                for i, col in enumerate(df.columns[1:], start=1):
-                                    chart.add_series({
-                                        "name": [safe_name, 0, i],
-                                        "categories": [safe_name, 1, 0, len(df), 0],
-                                        "values": [safe_name, 1, i, len(df), i],
-                                    })
-                                worksheet.insert_chart('G2', chart)
-                            except Exception:
-                                pass
+                        # chart logic: if this sheet matches the selected chart config, use chosen columns/rows
+                        if chart_config and (chart_config['fname'] in sheet_name or chart_config['sname'] in sheet_name):
+                            x = chart_config['x_col']
+                            ys = chart_config['y_cols']
+                            r0, r1 = chart_config['row_range']
+                            if x and ys:
+                                try:
+                                    # write a small helper sheet for chart data if needed
+                                    chart_sheet = safe_name
+                                    worksheet = writer.sheets.get(chart_sheet) or writer.book.add_worksheet(chart_sheet)
+                                    # Ensure data is in the sheet (it already is from to_excel above)
+                                    # Build chart using positions based on rows selected
+                                    chart = workbook.add_chart({'type': 'line'})
+                                    # compute row offsets: header at row 0, data starts row 1
+                                    for i, col in enumerate(df.columns, start=0):
+                                        if col == x:
+                                            x_col_idx = i
+                                    for col in ys:
+                                        try:
+                                            y_col_idx = list(df.columns).index(col)
+                                            chart.add_series({
+                                                'name': [chart_sheet, 0, y_col_idx],
+                                                'categories': [chart_sheet, 1 + r0, x_col_idx, 1 + r1, x_col_idx],
+                                                'values': [chart_sheet, 1 + r0, y_col_idx, 1 + r1, y_col_idx],
+                                            })
+                                        except ValueError:
+                                            continue
+                                    chart.set_title({'name': f"{safe_name} - Custom Chart"})
+                                    chart.set_x_axis({'name': x})
+                                    worksheet.insert_chart('G2', chart)
+                                except Exception as e:
+                                    st.warning(f"Failed to add custom chart for {safe_name}: {e}")
 
                 buffer.seek(0)
                 out_path = REPORT_DIR / out_name
@@ -447,6 +566,38 @@ with tabs[3]:
             if p.exists():
                 with open(p, 'rb') as f:
                     st.download_button(f"Download {pick}", data=f.read(), file_name=pick, mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+
+        st.markdown('---')
+        st.subheader('Manage reports')
+        manage_choices = rep_df.sort_values('modified', ascending=False)['file'].tolist()
+        to_manage = st.multiselect('Select report(s) to archive or delete', options=manage_choices)
+        col_a, col_b = st.columns(2)
+        with col_a:
+            if st.button('Archive selected'):
+                if not to_manage:
+                    st.warning('No reports selected')
+                else:
+                    for fn in to_manage:
+                        src = REPORT_DIR / fn
+                        dst = ARCHIVE_DIR / fn
+                        try:
+                            shutil.move(str(src), str(dst))
+                        except Exception as e:
+                            st.error(f'Failed to archive {fn}: {e}')
+                    st.success('Selected reports archived')
+                    st.experimental_rerun()
+        with col_b:
+            if st.button('Delete selected'):
+                if not to_manage:
+                    st.warning('No reports selected')
+                else:
+                    for fn in to_manage:
+                        try:
+                            (REPORT_DIR / fn).unlink()
+                        except Exception as e:
+                            st.error(f'Failed to delete {fn}: {e}')
+                    st.success('Selected reports deleted')
+                    st.experimental_rerun()
 
 
 # End of file
